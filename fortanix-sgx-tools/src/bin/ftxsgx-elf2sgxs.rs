@@ -15,7 +15,7 @@ extern crate failure;
 use std::borrow::Borrow;
 use std::fs::File;
 use std::io::{repeat, Error as IoError, Read};
-use std::mem::replace;
+use std::mem::{self, replace};
 use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
 
@@ -53,6 +53,7 @@ struct Symbols<'a> {
     EH_FRM_LEN: Option<&'a DynSymEntry>,
     EH_FRM_HDR_OFFSET: Option<&'a DynSymEntry>,
     EH_FRM_HDR_LEN: Option<&'a DynSymEntry>,
+    TCS_LIST: &'a DynSymEntry,
 }
 struct SectionRange {
     offset: u64,
@@ -232,7 +233,7 @@ impl<'a> LayoutInfo<'a> {
         // Tool must support both variants for backwards compatibility at least until 'https://github.com/fortanix/rust-sgx/issues/174' is merged into rust-lang.
         //
         // Variables have been renamed due to missing 'toolchain' version checks. Rename will cause compile-time failure if using old tool with new toolchain assembly code.
-        let syms = read_syms!(mandatory: sgx_entry, HEAP_BASE, HEAP_SIZE, RELA, RELACOUNT, ENCLAVE_SIZE, CFGDATA_BASE, DEBUG, TEXT_BASE, TEXT_SIZE
+        let syms = read_syms!(mandatory: sgx_entry, HEAP_BASE, HEAP_SIZE, RELA, RELACOUNT, ENCLAVE_SIZE, CFGDATA_BASE, DEBUG, TEXT_BASE, TEXT_SIZE, TCS_LIST
                               optional: EH_FRM_HDR_BASE, EH_FRM_HDR_SIZE, EH_FRM_OFFSET, EH_FRM_LEN, EH_FRM_HDR_OFFSET, EH_FRM_HDR_LEN
                               in syms : elf);
 
@@ -246,6 +247,7 @@ impl<'a> LayoutInfo<'a> {
         check_size!(syms.DEBUG == 1);
         check_size!(syms.TEXT_BASE == 8);
         check_size!(syms.TEXT_SIZE == 8);
+        check_size!(syms.TCS_LIST == 8);
 
         if (syms.ENCLAVE_SIZE.value() & (syms.ENCLAVE_SIZE.size() - 1)) != 0 {
             // ENCLAVE_SIZE should be naturally aligned such that `sgxs-append`
@@ -424,6 +426,7 @@ impl<'a> LayoutInfo<'a> {
         &self,
         writer: &mut CanonicalSgxsWriter<W>,
         heap_addr: u64,
+        tcs_list: u64,
         memory_size: u64,
         enclave_size: Option<u64>,
     ) -> Result<(), Error> {
@@ -449,6 +452,7 @@ impl<'a> LayoutInfo<'a> {
             Splice::for_sym_u8(self.sym.DEBUG, self.debug as _),
             Splice::for_sym_u64(self.sym.TEXT_BASE, self.text.offset),
             Splice::for_sym_u64(self.sym.TEXT_SIZE, self.text.size),
+            Splice::for_sym_u64(self.sym.TCS_LIST, tcs_list),
         ];
 
         if let (Some(EH_FRM_HDR_BASE), Some(EH_FRM_HDR_SIZE)) = (self.sym.EH_FRM_HDR_BASE, self.sym.EH_FRM_HDR_SIZE) {
@@ -581,12 +585,14 @@ impl<'a> LayoutInfo<'a> {
             + self.stack_size
             + TLS_SIZE
             + (1 + (nssa as u64) * (self.ssaframesize as u64)) * 0x1000;
-        let memory_size = thread_start + (self.threads as u64) * thread_size;
+        let tcs_list = thread_start + (self.threads as u64) * thread_size;
+        let memory_size = tcs_list + (self.threads as u64 + 1) * mem::size_of::<u64>() as u64;
         let enclave_size = if self.sized {
             Some(size_fit_natural(memory_size))
         } else {
             None
         };
+        let mut tcses: Vec<u64> = Vec::with_capacity(self.threads + 1);
 
         let mut writer = CanonicalSgxsWriter::new(
             writer,
@@ -598,7 +604,7 @@ impl<'a> LayoutInfo<'a> {
         )?;
 
         // Output ELF sections
-        self.write_elf_segments(&mut writer, heap_addr, memory_size, enclave_size)?;
+        self.write_elf_segments(&mut writer, heap_addr, tcs_list, memory_size, enclave_size)?;
 
         // Output heap
         let secinfo = SecinfoTruncated {
@@ -657,6 +663,7 @@ impl<'a> LayoutInfo<'a> {
                 flags: PageType::Tcs.into(),
             };
             writer.write_page(Some(&mut &tcs[..]), Some(tcs_addr), secinfo)?;
+            tcses.push(tcs_addr);
             let secinfo = SecinfoTruncated {
                 flags: SecinfoFlags::R | SecinfoFlags::W | PageType::Reg.into(),
             };
@@ -670,6 +677,15 @@ impl<'a> LayoutInfo<'a> {
             thread_start += thread_size;
         }
 
+        let tcs_list = thread_start;
+        tcses.push(0);
+        let secinfo = SecinfoTruncated {
+            flags: SecinfoFlags::R | PageType::Reg.into(),
+        };
+        let tcs_ptr = tcses.as_slice().as_ptr() as *const u8;
+        let size = tcses.len() * mem::size_of::<u64>() / mem::size_of::<u8>();
+        let tcses = unsafe{ &*std::ptr::slice_from_raw_parts(tcs_ptr, size) };
+        writer.write_pages(Some(&mut &tcses[..]), (size_fit_page(size as u64) / 0x1000) as usize, Some(tcs_list), secinfo)?;
         Ok(())
     }
 }
