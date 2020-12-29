@@ -1393,18 +1393,23 @@ impl<'tcs> IOHandlerInput<'tcs> {
     }
 
     #[inline(always)]
-    fn launch_thread(&self, tcs_address: usize) -> IoResult<()> {
-        // check if enclave is of type command
-        self.enclave
-            .kind
-            .as_command()
-            .ok_or(IoErrorKind::InvalidInput)?;
-        let tcs_address = TcsAddress(tcs_address);
-        let new_tcs = executor::block_on(async {
+    fn launch_thread(&self, tcs_address: Option<Tcs>) -> IoResult<()> {
+        async fn find_tcs(handler: &IOHandlerInput<'_>, tcs_address: &Option<TcsAddress>) -> IoResult<Option<StoppedTcs>> {
+            let mut guard = handler.enclave.available_enclave_threads.lock().await;
+            if let Some(tcs_address) = tcs_address {
+                Ok(guard.remove(&tcs_address))
+            } else {
+                // Pick any TCS available
+                let k = guard.keys().next().ok_or::<std::io::Error>(IoErrorKind::WouldBlock.into())?.to_owned();
+                Ok(guard.remove(&k))
+            }
+        }
+
+        fn select_tcs(handler: &IOHandlerInput, tcs_address: &Option<TcsAddress>) -> IoResult<StoppedTcs> {
+            executor::block_on(async {
                 loop {
-                    let mut guard = self.enclave.available_enclave_threads.lock().await;
-                    match guard.remove(&tcs_address) {
-                        Some(tcs) => break tcs,
+                    match find_tcs(handler, tcs_address).await? {
+                        Some(tcs) => break Ok(tcs),
                         None => {
                             // Release lock and try again. The enclave is in charge of its own TCS
                             // structs. Unfortunately, there is a small issue recording terminated
@@ -1414,11 +1419,19 @@ impl<'tcs> IOHandlerInput<'tcs> {
                             // When that TCS is subsequently selected to run a new thread, it may
                             // still not have terminated yet and thus may not yet be present in this
                             // `available_enclave_threads`. We need to wait for it to become ready.
-                            drop(guard);
                         }
                     }
                 }
-            });
+            })
+        }
+
+        // check if enclave is of type command
+        self.enclave
+            .kind
+            .as_command()
+            .ok_or(IoErrorKind::InvalidInput)?;
+        let tcs_address = tcs_address.map(|addr| TcsAddress(addr.as_ptr() as _));
+        let new_tcs = select_tcs(self, &tcs_address)?;
 
         let ret = self.work_sender.send(Work {
             tcs: RunningTcs {
