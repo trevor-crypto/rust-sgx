@@ -5,6 +5,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #[macro_use]
+extern crate bitflags;
+#[macro_use]
 extern crate clap;
 extern crate sgx_isa;
 extern crate sgxs as sgxs_crate;
@@ -53,7 +55,7 @@ struct Symbols<'a> {
     EH_FRM_LEN: Option<&'a DynSymEntry>,
     EH_FRM_HDR_OFFSET: Option<&'a DynSymEntry>,
     EH_FRM_HDR_LEN: Option<&'a DynSymEntry>,
-    TCS_LIST: &'a DynSymEntry,
+    TCS_LIST: Option<&'a DynSymEntry>,
 }
 struct SectionRange {
     offset: u64,
@@ -102,6 +104,75 @@ impl Splice {
             address: address.value(),
             value: vec![value],
             truncate: false,
+        }
+    }
+}
+
+bitflags! {
+    struct TcslsFlags: u16 {
+        const SECONDARY = 0b0000_0000_0000_0001;
+        const INIT_ONCE = 0b0000_0000_0000_0010;
+    }
+}
+
+impl Default for TcslsFlags {
+    fn default() -> TcslsFlags {
+        TcslsFlags::empty()
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Default)]
+struct TcslsTcsListItem {
+    tcs: u64,
+    next: u64,
+}
+
+/// Follows the macros at https://github.com/rust-lang/rust/blob/master/library/std/src/sys/sgx/abi/entry.S#L82
+#[repr(C, packed)]
+#[derive(Default)]
+struct Tcsls {
+    tcsls_tos: u64,
+    tcsls_flags: TcslsFlags,
+    tcsls_user_fcw: u16,
+    tcsls_user_mxcsr: u32,
+    tcsls_last_rsp: u64,
+    tcsls_panic_last_rsp: u64,
+    tcsls_debug_panic_buf_ptr: u64,
+    tcsls_user_rsp: u64,
+    tcsls_user_retip: u64,
+    tcsls_user_rbp: u64,
+    tcsls_user_r12: u64,
+    tcsls_user_r13: u64,
+    tcsls_user_r14: u64,
+    tcsls_user_r15: u64,
+    tcsls_tls_ptr: u64,
+    tcsls_tcs_addr: u64,
+    tcsls_tcs_list_item: TcslsTcsListItem,
+}
+
+impl Tcsls {
+    fn new(stack_tos: u64, secondary: bool, tcs_addr: u64, last_tcs_list_item: u64) -> Tcsls {
+        Tcsls {
+            tcsls_tos: stack_tos,
+            tcsls_flags: if secondary { TcslsFlags::SECONDARY } else { TcslsFlags::empty() },
+            tcsls_tcs_list_item: TcslsTcsListItem {
+                tcs: tcs_addr,
+                next: last_tcs_list_item,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn tcs_list_item_offset() -> u64 {
+        0x70
+    }
+}
+
+impl From<Tcsls> for [u8; 128] {
+    fn from(tcsls: Tcsls) -> Self {
+        unsafe {
+            std::mem::transmute(tcsls)
         }
     }
 }
@@ -233,8 +304,8 @@ impl<'a> LayoutInfo<'a> {
         // Tool must support both variants for backwards compatibility at least until 'https://github.com/fortanix/rust-sgx/issues/174' is merged into rust-lang.
         //
         // Variables have been renamed due to missing 'toolchain' version checks. Rename will cause compile-time failure if using old tool with new toolchain assembly code.
-        let syms = read_syms!(mandatory: sgx_entry, HEAP_BASE, HEAP_SIZE, RELA, RELACOUNT, ENCLAVE_SIZE, CFGDATA_BASE, DEBUG, TEXT_BASE, TEXT_SIZE, TCS_LIST
-                              optional: EH_FRM_HDR_BASE, EH_FRM_HDR_SIZE, EH_FRM_OFFSET, EH_FRM_LEN, EH_FRM_HDR_OFFSET, EH_FRM_HDR_LEN
+        let syms = read_syms!(mandatory: sgx_entry, HEAP_BASE, HEAP_SIZE, RELA, RELACOUNT, ENCLAVE_SIZE, CFGDATA_BASE, DEBUG, TEXT_BASE, TEXT_SIZE
+                              optional: EH_FRM_HDR_BASE, EH_FRM_HDR_SIZE, EH_FRM_OFFSET, EH_FRM_LEN, EH_FRM_HDR_OFFSET, EH_FRM_HDR_LEN, TCS_LIST
                               in syms : elf);
 
 
@@ -247,7 +318,6 @@ impl<'a> LayoutInfo<'a> {
         check_size!(syms.DEBUG == 1);
         check_size!(syms.TEXT_BASE == 8);
         check_size!(syms.TEXT_SIZE == 8);
-        check_size!(syms.TCS_LIST == 8);
 
         if (syms.ENCLAVE_SIZE.value() & (syms.ENCLAVE_SIZE.size() - 1)) != 0 {
             // ENCLAVE_SIZE should be naturally aligned such that `sgxs-append`
@@ -267,6 +337,10 @@ impl<'a> LayoutInfo<'a> {
             bail!("Missing EH Frame header symbols, application must either have (EH_FRM_HDR_BASE/EH_FRM_HDR_SIZE) or (EH_FRM_OFFSET, EH_FRM_LEN, EH_FRM_HDR_OFFSET, EH_FRM_HDR_LEN");
         }
         
+        if let Some(TCS_LIST) = syms.TCS_LIST {
+            check_size!(TCS_LIST == 8);
+        }
+
         Ok(syms)
     }
 
@@ -452,7 +526,6 @@ impl<'a> LayoutInfo<'a> {
             Splice::for_sym_u8(self.sym.DEBUG, self.debug as _),
             Splice::for_sym_u64(self.sym.TEXT_BASE, self.text.offset),
             Splice::for_sym_u64(self.sym.TEXT_SIZE, self.text.size),
-            Splice::for_sym_u64(self.sym.TCS_LIST, tcs_list),
         ];
 
         if let (Some(EH_FRM_HDR_BASE), Some(EH_FRM_HDR_SIZE)) = (self.sym.EH_FRM_HDR_BASE, self.sym.EH_FRM_HDR_SIZE) {
@@ -467,6 +540,10 @@ impl<'a> LayoutInfo<'a> {
         }
         else {
             bail!("Missing .eh_frame header symbols, application must have symbols exported by rust x86_64_fortanix_unknown_sgx toolchain, either (EH_FRM_HDR_BASE/EH_FRM_HDR_SIZE) or (EH_FRM_OFFSET, EH_FRM_LEN, EH_FRM_HDR_OFFSET, EH_FRM_HDR_LEN");
+        }
+
+        if let Some(TCS_LIST) = self.sym.TCS_LIST {
+            splices.push(Splice::for_sym_u64(TCS_LIST, tcs_list));
         }
 
         if let Some(enclave_size) = enclave_size {
@@ -580,13 +657,15 @@ impl<'a> LayoutInfo<'a> {
         let mut thread_start = heap_addr + self.heap_size;
         const THREAD_GUARD_SIZE: u64 = 0x10000;
         const TLS_SIZE: u64 = 0x1000;
+        assert!(TLS_SIZE > mem::size_of::<Tcsls>() as u64);
         let nssa = 1u32;
         let thread_size = THREAD_GUARD_SIZE
             + self.stack_size
             + TLS_SIZE
             + (1 + (nssa as u64) * (self.ssaframesize as u64)) * 0x1000;
-        let tcs_list = thread_start + (self.threads as u64) * thread_size;
-        let memory_size = tcs_list + (self.threads as u64 + 1) * mem::size_of::<u64>() as u64;
+        let tcs_list_item_offset = THREAD_GUARD_SIZE + self.stack_size + Tcsls::tcs_list_item_offset();
+        let tcs_list_head = thread_start + tcs_list_item_offset + (self.threads as u64 - 1) * thread_size;
+        let memory_size = thread_start + (self.threads as u64) * thread_size;
         let enclave_size = if self.sized {
             Some(size_fit_natural(memory_size))
         } else {
@@ -604,7 +683,7 @@ impl<'a> LayoutInfo<'a> {
         )?;
 
         // Output ELF sections
-        self.write_elf_segments(&mut writer, heap_addr, tcs_list, memory_size, enclave_size)?;
+        self.write_elf_segments(&mut writer, heap_addr, tcs_list_head, memory_size, enclave_size)?;
 
         // Output heap
         let secinfo = SecinfoTruncated {
@@ -617,6 +696,7 @@ impl<'a> LayoutInfo<'a> {
             secinfo
         )?;
 
+        let mut last_tcs_list_item = 0;
         for i in 0..self.threads {
             let stack_addr = thread_start + THREAD_GUARD_SIZE;
             let stack_tos = stack_addr + self.stack_size;
@@ -639,9 +719,8 @@ impl<'a> LayoutInfo<'a> {
                 (true, _) | (false, 0) => false,
                 (false, _) => true,
             };
-            let tls = unsafe {
-                std::mem::transmute::<_, [u8; 32]>([stack_tos, secondary as u64, 0u64, 0u64])
-            };
+            let tls: [u8; 128] = Tcsls::new(stack_tos, secondary, tcs_addr, last_tcs_list_item).into();
+            last_tcs_list_item = tls_addr + Tcsls::tcs_list_item_offset();
             let secinfo = SecinfoTruncated {
                 flags: SecinfoFlags::R | SecinfoFlags::W | PageType::Reg.into(),
             };
@@ -677,15 +756,6 @@ impl<'a> LayoutInfo<'a> {
             thread_start += thread_size;
         }
 
-        let tcs_list = thread_start;
-        tcses.push(0);
-        let secinfo = SecinfoTruncated {
-            flags: SecinfoFlags::R | PageType::Reg.into(),
-        };
-        let tcs_ptr = tcses.as_slice().as_ptr() as *const u8;
-        let size = tcses.len() * mem::size_of::<u64>() / mem::size_of::<u8>();
-        let tcses = unsafe{ &*std::ptr::slice_from_raw_parts(tcs_ptr, size) };
-        writer.write_pages(Some(&mut &tcses[..]), (size_fit_page(size as u64) / 0x1000) as usize, Some(tcs_list), secinfo)?;
         Ok(())
     }
 }

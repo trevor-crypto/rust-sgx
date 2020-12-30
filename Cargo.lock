@@ -695,6 +695,7 @@ name = "fortanix-sgx-tools"
 version = "0.5.0"
 dependencies = [
  "aesm-client",
+ "bitflags 1.2.1",
  "clap",
  "enclave-runner",
  "failure",
