@@ -55,7 +55,6 @@ struct Symbols<'a> {
     EH_FRM_LEN: Option<&'a DynSymEntry>,
     EH_FRM_HDR_OFFSET: Option<&'a DynSymEntry>,
     EH_FRM_HDR_LEN: Option<&'a DynSymEntry>,
-    TCS_LIST: Option<&'a DynSymEntry>,
 }
 struct SectionRange {
     offset: u64,
@@ -121,13 +120,6 @@ impl Default for TcslsFlags {
     }
 }
 
-#[repr(C, packed)]
-#[derive(Default)]
-struct TcslsTcsListItem {
-    tcs: u64,
-    next: u64,
-}
-
 /// Follows the macros at https://github.com/rust-lang/rust/blob/master/library/std/src/sys/sgx/abi/entry.S#L82
 #[repr(C, packed)]
 #[derive(Default)]
@@ -148,24 +140,19 @@ struct Tcsls {
     tcsls_user_r15: u64,
     tcsls_tls_ptr: u64,
     tcsls_tcs_addr: u64,
-    tcsls_tcs_list_item: TcslsTcsListItem,
+    tcsls_static_tcs_addr: u64,
+    tcsls_clist_next: u64,
 }
 
 impl Tcsls {
-    fn new(stack_tos: u64, secondary: bool, tcs_addr: u64, last_tcs_list_item: u64) -> Tcsls {
+    fn new(stack_tos: u64, secondary: bool, tcs_addr: u64, tcsls_clist_next: u64) -> Tcsls {
         Tcsls {
             tcsls_tos: stack_tos,
             tcsls_flags: if secondary { TcslsFlags::SECONDARY } else { TcslsFlags::empty() },
-            tcsls_tcs_list_item: TcslsTcsListItem {
-                tcs: tcs_addr,
-                next: last_tcs_list_item,
-            },
+            tcsls_static_tcs_addr: tcs_addr,
+            tcsls_clist_next,
             ..Default::default()
         }
-    }
-
-    fn tcs_list_item_offset() -> u64 {
-        0x70
     }
 }
 
@@ -305,7 +292,7 @@ impl<'a> LayoutInfo<'a> {
         //
         // Variables have been renamed due to missing 'toolchain' version checks. Rename will cause compile-time failure if using old tool with new toolchain assembly code.
         let syms = read_syms!(mandatory: sgx_entry, HEAP_BASE, HEAP_SIZE, RELA, RELACOUNT, ENCLAVE_SIZE, CFGDATA_BASE, DEBUG, TEXT_BASE, TEXT_SIZE
-                              optional: EH_FRM_HDR_BASE, EH_FRM_HDR_SIZE, EH_FRM_OFFSET, EH_FRM_LEN, EH_FRM_HDR_OFFSET, EH_FRM_HDR_LEN, TCS_LIST
+                              optional: EH_FRM_HDR_BASE, EH_FRM_HDR_SIZE, EH_FRM_OFFSET, EH_FRM_LEN, EH_FRM_HDR_OFFSET, EH_FRM_HDR_LEN
                               in syms : elf);
 
 
@@ -335,10 +322,6 @@ impl<'a> LayoutInfo<'a> {
             check_size!(EH_FRM_HDR_LEN == 8);
         } else {
             bail!("Missing EH Frame header symbols, application must either have (EH_FRM_HDR_BASE/EH_FRM_HDR_SIZE) or (EH_FRM_OFFSET, EH_FRM_LEN, EH_FRM_HDR_OFFSET, EH_FRM_HDR_LEN");
-        }
-        
-        if let Some(TCS_LIST) = syms.TCS_LIST {
-            check_size!(TCS_LIST == 8);
         }
 
         Ok(syms)
@@ -500,7 +483,6 @@ impl<'a> LayoutInfo<'a> {
         &self,
         writer: &mut CanonicalSgxsWriter<W>,
         heap_addr: u64,
-        tcs_list: u64,
         memory_size: u64,
         enclave_size: Option<u64>,
     ) -> Result<(), Error> {
@@ -540,10 +522,6 @@ impl<'a> LayoutInfo<'a> {
         }
         else {
             bail!("Missing .eh_frame header symbols, application must have symbols exported by rust x86_64_fortanix_unknown_sgx toolchain, either (EH_FRM_HDR_BASE/EH_FRM_HDR_SIZE) or (EH_FRM_OFFSET, EH_FRM_LEN, EH_FRM_HDR_OFFSET, EH_FRM_HDR_LEN");
-        }
-
-        if let Some(TCS_LIST) = self.sym.TCS_LIST {
-            splices.push(Splice::for_sym_u64(TCS_LIST, tcs_list));
         }
 
         if let Some(enclave_size) = enclave_size {
@@ -663,8 +641,6 @@ impl<'a> LayoutInfo<'a> {
             + self.stack_size
             + TLS_SIZE
             + (1 + (nssa as u64) * (self.ssaframesize as u64)) * 0x1000;
-        let tcs_list_item_offset = THREAD_GUARD_SIZE + self.stack_size + Tcsls::tcs_list_item_offset();
-        let tcs_list_head = thread_start + tcs_list_item_offset + (self.threads as u64 - 1) * thread_size;
         let memory_size = thread_start + (self.threads as u64) * thread_size;
         let enclave_size = if self.sized {
             Some(size_fit_natural(memory_size))
@@ -683,7 +659,7 @@ impl<'a> LayoutInfo<'a> {
         )?;
 
         // Output ELF sections
-        self.write_elf_segments(&mut writer, heap_addr, tcs_list_head, memory_size, enclave_size)?;
+        self.write_elf_segments(&mut writer, heap_addr, memory_size, enclave_size)?;
 
         // Output heap
         let secinfo = SecinfoTruncated {
@@ -696,7 +672,7 @@ impl<'a> LayoutInfo<'a> {
             secinfo
         )?;
 
-        let mut last_tcs_list_item = 0;
+        let mut tcsls_clist_item_prev = thread_start as u64 + ((self.threads as u64 - 1) * thread_size) + THREAD_GUARD_SIZE + self.stack_size;
         for i in 0..self.threads {
             let stack_addr = thread_start + THREAD_GUARD_SIZE;
             let stack_tos = stack_addr + self.stack_size;
@@ -719,8 +695,8 @@ impl<'a> LayoutInfo<'a> {
                 (true, _) | (false, 0) => false,
                 (false, _) => true,
             };
-            let tls: [u8; 128] = Tcsls::new(stack_tos, secondary, tcs_addr, last_tcs_list_item).into();
-            last_tcs_list_item = tls_addr + Tcsls::tcs_list_item_offset();
+            let tls: [u8; 128] = Tcsls::new(stack_tos, secondary, tcs_addr, tcsls_clist_item_prev).into();
+            tcsls_clist_item_prev = tls_addr;
             let secinfo = SecinfoTruncated {
                 flags: SecinfoFlags::R | SecinfoFlags::W | PageType::Reg.into(),
             };
