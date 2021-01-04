@@ -43,9 +43,9 @@ The memory region pointed to by `OGSBASGX` should be initialized as follows:
 - Offset `0x8`: `1` if this is an executable and this is a secondary TCS, `0`
   otherwise.
 - Offsets `0x10`, `0x18`, `0x20`: `0`
-- Offsets `0x70` and `0x78`: An item of a linked list containing (i) the offset
-    to the TCS structure from the image base and (ii) offset to the next item
-    in the list from the image base.
+- Offset `0x70`: The offset to the TCS structure from the image base.
+- Offset `0x78`: The offset to the next TCSLS struct (part of a circular linked
+    list) from the image base.
 - Other offsets: uninitialized.
 
 ## Globals
@@ -73,4 +73,3 @@ binary.
   of the ELF section named '.eh_frame'.
 - `EH_FRM_LEN`. Size 8 bytes. The size in bytes of the ELF section named
   '.eh_frame'.
-- `TCS_LIST` Size 8 bytes. The base address (relative to enclave start) of the TCS list.
