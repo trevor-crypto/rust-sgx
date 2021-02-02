@@ -117,7 +117,7 @@ fn args_desc<'a>() -> clap::App<'a, 'a> {
         .arg(Arg::with_name("date")                               .long("date")      .value_name("YYYYMMDD").validator(date_validate)   .help("Sets the DATE field (default: today)"))
         .arg(Arg::with_name("isvprodid")               .short("p").long("isvprodid") .takes_value(true)     .validator(num_validate)    .help("Sets the ISVPRODID field (default: 0)"))
         .arg(Arg::with_name("isvsvn")                  .short("v").long("isvsvn")    .takes_value(true)     .validator(num_validate)    .help("Sets the ISVSVN field (default: 0)"))
-        .arg(Arg::with_name("key-file")                .short("k").long("key")       .value_name("FILE")    .required(true)             .help("Sets the path to the PEM-encoded RSA private key"))
+        .arg(Arg::with_name("key-file")                .short("k").long("key")       .value_name("FILE")                                .help("Sets the path to the PEM-encoded RSA private key, otherwise reads from standard input"))
         .arg(Arg::with_name("verifykey")               .short("V").long("resign-verify").value_name("FILE")                             .help("Verify the output file is a correct signature using the specified PEM-encoded RSA private key"))
         .arg(Arg::with_name("input-hash")                         .long("in-hash")                                                      .help("<input> specifies the ENCLAVEHASH field directly, instead of an SGXS file"))
         .arg(Arg::with_name("input")                                                                        .required(true)             .help("The enclave SGXS file that will be hashed"))
@@ -215,10 +215,23 @@ fn main() {
     let matches = args_desc().get_matches();
 
     let mut pem = vec![];
-    File::open(matches.value_of("key-file").unwrap())
-        .expect("Unable to open input key file")
-        .read_to_end(&mut pem)
-        .expect("Unable to read input key file");
+    match matches.value_of("key-file") {
+        Some(file_path) => {
+            File::open(file_path)
+                .expect("Unable to open input key file")
+                .read_to_end(&mut pem)
+                .expect("Unable to read input key file");
+        }
+        None => {
+            let bytes = std::io::stdin()
+                .read_to_end(&mut pem)
+                .expect("Unable to read stdin for input key");
+            if bytes == 0 {
+                panic!("No key written into stdin");
+            }
+        }
+    }
+
     let key = PKey::private_key_from_pem(&pem).unwrap();
 
     let sig = do_sign(&matches, &key);
@@ -243,7 +256,11 @@ fn main() {
 
     write_sigstruct(matches.value_of("output").unwrap(), sig);
 
-    println!("ENCLAVEHASH: {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} (OK)",enclavehash[0],enclavehash[1],enclavehash[2],enclavehash[3],enclavehash[4],enclavehash[5],enclavehash[6],enclavehash[7],enclavehash[8],enclavehash[9],enclavehash[10],enclavehash[11],enclavehash[12],enclavehash[13],enclavehash[14],enclavehash[15],enclavehash[16],enclavehash[17],enclavehash[18],enclavehash[19],enclavehash[20],enclavehash[21],enclavehash[22],enclavehash[23],enclavehash[24],enclavehash[25],enclavehash[26],enclavehash[27],enclavehash[28],enclavehash[29],enclavehash[30],enclavehash[31]);
+    print!("ENCLAVEHASH: ");
+    for b in &enclavehash {
+        print!("{:02x}", b);
+    }
+    println!("");
 }
 
 #[cfg(test)]
@@ -259,9 +276,9 @@ fn test_sig() {
         "--date",
         "20160109",
         "--in-hash",
+        "c50673624a6cb17c1c6c2a4e6906f47a170c4629b8723781d1017ef376f1a75d",
         "-k",
         "KEY",
-        "c50673624a6cb17c1c6c2a4e6906f47a170c4629b8723781d1017ef376f1a75d",
         "OUTPUT",
     ]);
 
@@ -271,8 +288,5 @@ fn test_sig() {
 
     sigstruct::verify::<_, Hasher>(&sig, &*key.rsa().unwrap()).unwrap();
 
-    assert_eq!(
-        sig.as_ref(),
-        SIGSTRUCT
-    );
+    assert_eq!(sig.as_ref(), SIGSTRUCT);
 }
