@@ -264,29 +264,64 @@ fn main() {
 }
 
 #[cfg(test)]
-#[test]
-fn test_sig() {
-    static KEY: &'static [u8] = include_bytes!("../../tests/data/sig1.key.pem");
-    static SIGSTRUCT: &'static [u8] = include_bytes!("../../tests/data/sig1.sigstruct.bin");
+mod test {
+    use std::convert::TryInto;
 
-    let matches = args_desc().get_matches_from(&[
-        "ARG0",
-        "-x",
-        "3/0xe4",
-        "--date",
-        "20160109",
-        "--in-hash",
-        "c50673624a6cb17c1c6c2a4e6906f47a170c4629b8723781d1017ef376f1a75d",
-        "-k",
-        "KEY",
-        "OUTPUT",
-    ]);
+    use pbkdf2::password_hash::{PasswordHasher, Salt};
+    use pbkdf2::{Params, Pbkdf2};
+    use rand_chacha::rand_core::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+    use rsa::{PrivateKeyPemEncoding, RSAPrivateKey};
 
-    let key = PKey::private_key_from_pem(KEY).unwrap();
+    use super::*;
 
-    let sig = do_sign(&matches, &key);
+    #[test]
+    fn test_sig() {
+        static KEY: &'static [u8] = include_bytes!("../../tests/data/sig1.key.pem");
+        static SIGSTRUCT: &'static [u8] = include_bytes!("../../tests/data/sig1.sigstruct.bin");
 
-    sigstruct::verify::<_, Hasher>(&sig, &*key.rsa().unwrap()).unwrap();
+        let matches = args_desc().get_matches_from(&[
+            "ARG0",
+            "-x",
+            "3/0xe4",
+            "--date",
+            "20160109",
+            "--in-hash",
+            "c50673624a6cb17c1c6c2a4e6906f47a170c4629b8723781d1017ef376f1a75d",
+            "-k",
+            "KEY",
+            "OUTPUT",
+        ]);
 
-    assert_eq!(sig.as_ref(), SIGSTRUCT);
+        let key = PKey::private_key_from_pem(KEY).unwrap();
+
+        let sig = do_sign(&matches, &key);
+
+        sigstruct::verify::<_, Hasher>(&sig, &*key.rsa().unwrap()).unwrap();
+
+        assert_eq!(sig.as_ref(), SIGSTRUCT);
+    }
+
+    #[test]
+    fn test_seedable() {
+        let seed = "95af85862c6966a5936c4b8a674112a75a39ab1c6f0f273e0cb8e409b8863398"; // 64 octets seed
+        let salt = Salt::new("00000000000000000000000000000000").expect("can't pour salt"); // 32 octets salt
+
+        // hash and put into 32 byte array
+        let hash = Pbkdf2
+            .hash_password(seed.as_bytes(), None, None, Params::default(), salt)
+            .expect("can't hash")
+            .hash
+            .expect("hash output not found");
+
+        let seed: [u8; 32] = hash
+            .as_bytes()
+            .try_into()
+            .expect("cannot fit into 32 byte array");
+        let mut rng = ChaCha20Rng::from_seed(seed);
+        let rsa = RSAPrivateKey::new(&mut rng, 1024).expect("couldn't create rsa key");
+
+        let pem = rsa.to_pem_pkcs8().expect("could not convert to pem format");
+        println!("{}", pem);
+    }
 }
